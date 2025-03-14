@@ -1,9 +1,9 @@
 {
     "records": {
-      "dev.demo": "127.0.0.1",
-      "api.demo": "192.168.1.100",
-      "*.test.demo": "10.0.0.5"
+      "dev.kiss.dns": "127.0.0.1",
+      "api.kiss.dns": "127.0.0.2",
+      "*.test.kiss.dns": "127.0.0.3",
+      "ipv6.kiss.dns": "fe80::6049:67ff:fedb:e84d"
     },
     "fallback_dns": "8.8.8.8"
-  }
-  
+}
