@@ -8,8 +8,9 @@ readme = "README.md"
 homepage = "https://github.com/gni/kissdns"
 repository = "https://github.com/gni/kissdns"
 documentation = "https://docs.rs/kissdns"
-categories = ["network-programming", "dns"]
-keywords = ["dns", "server", "fallback", "cache", "wildcard", "development"]
+categories = ["network-programming", "development-tools", "simulation"]
+keywords = ["dns", "server", "fallback", "wildcard", "development"]
+license-file = "LICENSE"
 
 [dependencies]
 serde = { version = "1.0.219", features = ["derive"] }
