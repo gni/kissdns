@@ -103,6 +103,42 @@ RUST_LOG=debug kissdns
 
 These commands will display additional log messages for easier debugging.
 
+
+## Test with dig and nslookup
+
+dig
+
+```bash
+dig @127.0.0.1 -p 5533 dev.kiss.dns
+;; Got answer:
+;; ->>HEADER<<- opcode: QUERY, status: NOERROR, id: 16792
+;; flags: qr rd ra; QUERY: 1, ANSWER: 1, AUTHORITY: 0, ADDITIONAL: 0
+
+;; QUESTION SECTION:
+;dev.kiss.dns.                  IN      A
+
+;; ANSWER SECTION:
+dev.kiss.dns.           60      IN      A       127.0.0.1
+
+;; Query time: 0 msec
+;; SERVER: 127.0.0.1#5533(127.0.0.1) (UDP)
+;; WHEN: Fri Mar 14 01:34:28 CET 2025
+;; MSG SIZE  rcvd: 46
+```
+
+nslookup
+```bash
+nslookup -port=5533 ipv6.kiss.dns 127.0.0.1
+Server:         127.0.0.1
+Address:        127.0.0.1#5533
+
+Non-authoritative answer:
+Name:   ipv6.kiss.dns
+Address: fe80::6049:67ff:fedb:e84d
+
+Authoritative answers can be found from:
+```
+
 ## Why KissDNS?
 
 KissDNS stands for **Keep It Simple, Stupid DNS**. It’s designed for developers working in environments without root privileges or under strict security restrictions. KissDNS offers a quick, simple, and flexible solution for local domain resolution without complex system modifications.
