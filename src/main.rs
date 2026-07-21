@@ -1,11 +1,10 @@
-mod dns_handler;
 mod config;
+mod dns_handler;
 
-use dns_handler::DNSHandler;
 use config::load_config;
+use dns_handler::DNSHandler;
 use std::env;
 use std::process;
-use ctrlc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -51,7 +50,20 @@ fn main() {
         .expect("Error setting Ctrl-C handler");
     }
 
-    // Create the DNS handler passing in configuration and the shutdown flag.
-    let handler = DNSHandler::new(config, shutdown_flag.clone());
+    // On Unix, SIGHUP requests a configuration reload. The signal handler only
+    // updates an atomic flag; parsing and applying the configuration happens in
+    // the server loop, outside of the signal context.
+    let reload_flag = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    if let Err(e) = signal_hook::flag::register(
+        signal_hook::consts::signal::SIGHUP,
+        Arc::clone(&reload_flag),
+    ) {
+        log::error!("Failed to register SIGHUP handler: {}", e);
+        process::exit(1);
+    }
+
+    // Create the DNS handler passing in configuration and the signal flags.
+    let handler = DNSHandler::new(config, config_path, shutdown_flag, reload_flag);
     handler.start(&port);
 }

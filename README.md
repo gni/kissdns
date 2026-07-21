@@ -31,6 +31,9 @@ for development, testing, and secure domain resolution without requiring adminis
 - **Graceful Shutdown:**  
   Uses a shutdown flag and Ctrl+C handler for clean termination.
 
+- **Live Configuration Reload:**
+  On Unix systems, reloads records and fallback settings on `SIGHUP` without restarting the server.
+
 ## Installation
 
 Simply install KissDNS via Cargo:
@@ -70,6 +73,22 @@ Or pass a custom configuration file path and/or port as command-line arguments:
   ```sh
   kissdns myconfig.json 5532
   ```
+
+### Reloading Configuration
+
+On Unix systems, update the active configuration file and send `SIGHUP` to the KissDNS process:
+
+```sh
+kill -HUP <pid>
+```
+
+For a container, send the signal to its main process:
+
+```sh
+docker kill --signal HUP <container>
+```
+
+KissDNS validates the file before replacing the active configuration. A successful reload clears cached DNS responses so the new records take effect immediately. If loading fails, the server logs the error and continues using the previous configuration.
 
 ## Example `hosts.json`
 
@@ -120,7 +139,7 @@ podman build --target kissdns-alpine -t kissdns-alpine .
 >
 > ```sh
 > docker build --target kissdns-builder-alpine -t kissdns-builder-alpine .
-> docker run -it --rm --volume "$PWD:/src" --entrypoint '/bin/bash' kissdns-builder-alpine
+> docker run -it --rm --volume "$PWD:/src" --entrypoint '/bin/sh' kissdns-builder-alpine
 > # ... do something inside the container, for example `cargo test`
 > ```
 
@@ -129,7 +148,7 @@ podman build --target kissdns-alpine -t kissdns-alpine .
 Synopsis:
 
 ```
-docker run --rm -it kissdns-alpine [kissdns ARGUMENTS ...]
+docker run --rm -it kissdns-alpine [CONFIG_PATH] [PORT]
 ```
 
 > [!NOTE]
@@ -153,7 +172,7 @@ docker run --rm -it kissdns-alpine [kissdns ARGUMENTS ...]
 >   --publish '5533:5533/tcp' \
 >   --publish '5533:5533/udp' \
 >   --volume "/tmp/kissdns-config.json:/etc/kissdns-config.json:ro" \
->   kissdns-alpine -- /etc/kissdns-config.json
+>   kissdns-alpine /etc/kissdns-config.json 5533
 > ```
 > or with additional verbosity:
 > ```sh
@@ -162,7 +181,7 @@ docker run --rm -it kissdns-alpine [kissdns ARGUMENTS ...]
 >   --publish '5533:5533/udp' \
 >   --env 'RUST_LOG=debug' \
 >   --volume "/tmp/kissdns-config.json:/etc/kissdns-config.json:ro" \
->   kissdns-alpine -- /etc/kissdns-config.json
+>   kissdns-alpine /etc/kissdns-config.json 5533
 > ```
 
 > [!TIP]
@@ -170,7 +189,7 @@ docker run --rm -it kissdns-alpine [kissdns ARGUMENTS ...]
 > the only `kissdns`) interactively, such command may be used:
 >
 > ```sh
-> docker run -it --rm --volume "$PWD:/opt/data" --entrypoint '/bin/bash' kissdns-alpine
+> docker run -it --rm --volume "$PWD:/opt/data" --entrypoint '/bin/sh' kissdns-alpine
 > # ... do something inside the container, for example `kissdns 2342`
 > ```
 
