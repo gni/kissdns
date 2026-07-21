@@ -93,6 +93,8 @@ If no configuration file is found, KissDNS creates a default file. For example:
 - **fallback_dns:**  
   DNS server used for queries not found in your local configuration.
 
+See [schema definition](docs/schema.v1.json) for more details.
+
 ## Running in OCI container
 
 1\. Retrieve container
