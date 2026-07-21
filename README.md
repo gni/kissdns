@@ -99,16 +99,7 @@ See [schema definition](docs/schema.v1.json) for more details.
 
 1\. Retrieve container
 
-Pull published container from ghcr.io:
-
-```sh
-docker pull ghcr.io/unsektor/kissdns:latest-alpine
-
-# ... or with podman:
-podman pull ghcr.io/unsektor/kissdns:latest-alpine
-```
-
-or build manually:
+Build manually:
 
 ```sh
 docker build --target kissdns-alpine -t kissdns-alpine .
