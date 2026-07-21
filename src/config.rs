@@ -31,8 +31,15 @@ const DEFAULT_CONFIG: &str = r#"
 /// If the file does not exist, a default configuration file is created and the user is informed.
 pub fn load_config(file_path: &str) -> Result<DNSConfig, Box<dyn Error>> {
     if !Path::new(file_path).exists() {
-        println!("Configuration file '{}' not found. Creating default configuration.", file_path);
-        let mut file = OpenOptions::new().write(true).create(true).open(file_path)?;
+        println!(
+            "Configuration file '{}' not found. Creating default configuration.",
+            file_path
+        );
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(file_path)?;
         file.write_all(DEFAULT_CONFIG.as_bytes())?;
         file.flush()?;
         println!("Default configuration file '{}' created.", file_path);

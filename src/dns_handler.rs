@@ -1,10 +1,10 @@
-use crate::config::DNSConfig;
+use crate::config::{DNSConfig, load_config};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone)]
@@ -12,21 +12,23 @@ struct CacheEntry {
     // For TCP, this will be the DNS message (without the 2-byte length header)
     response: Vec<u8>,
     expires_at: Instant,
+    config_generation: usize,
 }
 
 /// Given a DNSConfig and a domain name, resolve the domain using exact match
 /// or wildcard matching. Wildcard keys must start with "*." and are matched using ends_with.
 fn resolve_domain_from_config(conf: &DNSConfig, domain: &str) -> Option<IpAddr> {
-    if let Some(ip_str) = conf.records.get(domain) {
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            return Some(ip);
-        }
+    if let Some(ip_str) = conf.records.get(domain)
+        && let Ok(ip) = ip_str.parse::<IpAddr>()
+    {
+        return Some(ip);
     }
     for (pattern, ip_str) in &conf.records {
-        if pattern.starts_with("*.") && domain.ends_with(&pattern[1..]) {
-            if let Ok(ip) = ip_str.parse::<IpAddr>() {
-                return Some(ip);
-            }
+        if pattern.starts_with("*.")
+            && domain.ends_with(&pattern[1..])
+            && let Ok(ip) = ip_str.parse::<IpAddr>()
+        {
+            return Some(ip);
         }
     }
     None
@@ -37,17 +39,67 @@ fn resolve_domain_from_config(conf: &DNSConfig, domain: &str) -> Option<IpAddr> 
 /// and forwarding queries to a fallback DNS server if needed.
 pub struct DNSHandler {
     config: Arc<RwLock<DNSConfig>>,
+    config_path: String,
+    config_generation: Arc<AtomicUsize>,
     cache: Arc<RwLock<HashMap<(String, u16), CacheEntry>>>,
     shutdown: Arc<AtomicBool>,
+    reload: Arc<AtomicBool>,
 }
 
 impl DNSHandler {
-    /// Create a new DNSHandler with the provided configuration and shutdown flag.
-    pub fn new(config: DNSConfig, shutdown: Arc<AtomicBool>) -> Self {
+    /// Create a new DNSHandler with the provided configuration and signal flags.
+    pub fn new(
+        config: DNSConfig,
+        config_path: String,
+        shutdown: Arc<AtomicBool>,
+        reload: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             config: Arc::new(RwLock::new(config)),
+            config_path,
+            config_generation: Arc::new(AtomicUsize::new(0)),
             cache: Arc::new(RwLock::new(HashMap::new())),
             shutdown,
+            reload,
+        }
+    }
+
+    /// Reload the configuration after a signal requests it. A failed reload
+    /// leaves both the active configuration and its cached responses unchanged.
+    fn reload_config_if_requested(&self) {
+        if !self.reload.swap(false, Ordering::SeqCst) {
+            return;
+        }
+
+        info!("Configuration reload requested");
+        match load_config(&self.config_path) {
+            Ok(config) => {
+                let record_count = config.records.len();
+                *self
+                    .config
+                    .write()
+                    .expect("Failed to acquire config write lock") = config;
+
+                // Cache entries are tagged with the configuration generation so
+                // an in-flight TCP request cannot reintroduce a stale answer
+                // after this clear.
+                self.config_generation.fetch_add(1, Ordering::SeqCst);
+                self.cache
+                    .write()
+                    .expect("Failed to acquire cache write lock")
+                    .clear();
+
+                info!(
+                    "Configuration reloaded from {} ({} records)",
+                    self.config_path, record_count
+                );
+            }
+            Err(e) => {
+                error!(
+                    "Failed to reload configuration from {}: {}. Keeping the current configuration",
+                    self.config_path, e
+                );
+            }
         }
     }
 
@@ -70,7 +122,10 @@ impl DNSHandler {
 
     /// For convenience, this method wraps the free function for wildcard resolution.
     fn resolve_domain(&self, domain: &str) -> Option<IpAddr> {
-        let conf = self.config.read().expect("Failed to acquire config read lock");
+        let conf = self
+            .config
+            .read()
+            .expect("Failed to acquire config read lock");
         resolve_domain_from_config(&conf, domain)
     }
 
@@ -91,6 +146,7 @@ impl DNSHandler {
 
         // Spawn the TCP server in a separate thread.
         let config_clone = Arc::clone(&self.config);
+        let config_generation_clone = Arc::clone(&self.config_generation);
         let cache_clone = Arc::clone(&self.cache);
         let shutdown_clone = Arc::clone(&self.shutdown);
         std::thread::spawn(move || {
@@ -114,9 +170,10 @@ impl DNSHandler {
                     Ok((mut stream, addr)) => {
                         info!("Accepted TCP connection from {}", addr);
                         let config = Arc::clone(&config_clone);
+                        let config_generation = Arc::clone(&config_generation_clone);
                         let cache = Arc::clone(&cache_clone);
                         std::thread::spawn(move || {
-                            handle_tcp_request(&mut stream, &config, &cache);
+                            handle_tcp_request(&mut stream, &config, &config_generation, &cache);
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -135,6 +192,8 @@ impl DNSHandler {
             .expect("Failed to set UDP socket to non-blocking");
         let mut buf = [0u8; 512];
         while !self.shutdown.load(Ordering::SeqCst) {
+            self.reload_config_if_requested();
+
             match udp_socket.recv_from(&mut buf) {
                 Ok((size, src)) => {
                     if size < 12 {
@@ -143,31 +202,44 @@ impl DNSHandler {
                     }
                     if let Some((domain, qtype)) = Self::parse_query(&buf[..size]) {
                         let cache_key = (domain.clone(), qtype);
-                        if let Some(entry) = self.cache.read().unwrap().get(&cache_key) {
-                            if Instant::now() < entry.expires_at {
-                                info!("Cache hit for {} (qtype {})", domain, qtype);
-                                // Clone the cached response and update its transaction ID using buf[0..2].
-                                let mut cached_response = entry.response.clone();
-                                cached_response[0] = buf[0];
-                                cached_response[1] = buf[1];
-                                if let Err(e) = udp_socket.send_to(&cached_response, &src) {
-                                    error!("Failed to send cached response to {}: {}", src, e);
-                                }
-                                continue;
+                        let config_generation = self.config_generation.load(Ordering::SeqCst);
+                        if let Some(entry) = self.cache.read().unwrap().get(&cache_key)
+                            && entry.config_generation == config_generation
+                            && Instant::now() < entry.expires_at
+                        {
+                            info!("Cache hit for {} (qtype {})", domain, qtype);
+                            // Clone the cached response and update its transaction ID using buf[0..2].
+                            let mut cached_response = entry.response.clone();
+                            cached_response[0] = buf[0];
+                            cached_response[1] = buf[1];
+                            if let Err(e) = udp_socket.send_to(&cached_response, src) {
+                                error!("Failed to send cached response to {}: {}", src, e);
                             }
+                            continue;
                         }
                         let response = if let Some(ip) = self.resolve_domain(&domain) {
                             match (qtype, ip) {
                                 (1, IpAddr::V4(ipv4)) | (255, IpAddr::V4(ipv4)) => {
                                     info!("[UDP] Resolving {} -> {}", domain, ipv4);
-                                    DNSHandler::build_dns_response(&buf[..size], IpAddr::V4(ipv4), qtype)
+                                    DNSHandler::build_dns_response(
+                                        &buf[..size],
+                                        IpAddr::V4(ipv4),
+                                        qtype,
+                                    )
                                 }
                                 (28, IpAddr::V6(ipv6)) | (255, IpAddr::V6(ipv6)) => {
                                     info!("[UDP] Resolving {} -> {}", domain, ipv6);
-                                    DNSHandler::build_dns_response(&buf[..size], IpAddr::V6(ipv6), qtype)
+                                    DNSHandler::build_dns_response(
+                                        &buf[..size],
+                                        IpAddr::V6(ipv6),
+                                        qtype,
+                                    )
                                 }
                                 _ => {
-                                    info!("[UDP] Record type mismatch for {}, returning NXDOMAIN", domain);
+                                    info!(
+                                        "[UDP] Record type mismatch for {}, returning NXDOMAIN",
+                                        domain
+                                    );
                                     DNSHandler::build_nxdomain_response(&buf[..size])
                                 }
                             }
@@ -185,7 +257,10 @@ impl DNSHandler {
                                         resp
                                     }
                                     None => {
-                                        info!("[UDP] Fallback resolution for {} failed, returning NXDOMAIN", domain);
+                                        info!(
+                                            "[UDP] Fallback resolution for {} failed, returning NXDOMAIN",
+                                            domain
+                                        );
                                         DNSHandler::build_nxdomain_response(&buf[..size])
                                     }
                                 }
@@ -196,8 +271,15 @@ impl DNSHandler {
                         };
                         // Cache the response for 60 seconds.
                         let expires = Instant::now() + Duration::from_secs(60);
-                        self.cache.write().unwrap().insert(cache_key, CacheEntry { response: response.clone(), expires_at: expires });
-                        if let Err(e) = udp_socket.send_to(&response, &src) {
+                        self.cache.write().unwrap().insert(
+                            cache_key,
+                            CacheEntry {
+                                response: response.clone(),
+                                expires_at: expires,
+                                config_generation,
+                            },
+                        );
+                        if let Err(e) = udp_socket.send_to(&response, src) {
                             error!("Failed to send DNS response to {}: {}", src, e);
                         }
                     } else {
@@ -321,6 +403,7 @@ impl DNSHandler {
 fn handle_tcp_request(
     stream: &mut TcpStream,
     config: &Arc<RwLock<DNSConfig>>,
+    config_generation: &Arc<AtomicUsize>,
     cache: &Arc<RwLock<HashMap<(String, u16), CacheEntry>>>,
 ) {
     let mut buffer = [0u8; 1024];
@@ -338,37 +421,50 @@ fn handle_tcp_request(
             let query = &buffer[0..query_size + 2];
             if let Some((domain, qtype)) = DNSHandler::parse_query(&buffer[2..query_size + 2]) {
                 let cache_key = (domain.clone(), qtype);
-                if let Some(entry) = cache.read().unwrap().get(&cache_key) {
-                    if Instant::now() < entry.expires_at {
-                        info!("Cache hit for {} (qtype {})", domain, qtype);
-                        let mut cached_body = entry.response.clone();
-                        // For TCP, the cached DNS message starts at offset 0.
-                        cached_body[0] = buffer[2];
-                        cached_body[1] = buffer[3];
-                        let mut full_response = vec![
-                            (cached_body.len() >> 8) as u8,
-                            (cached_body.len() & 0xFF) as u8,
-                        ];
-                        full_response.extend_from_slice(&cached_body);
-                        if let Err(e) = stream.write_all(&full_response) {
-                            error!("Failed to send cached TCP response: {}", e);
-                        }
-                        return;
+                let current_generation = config_generation.load(Ordering::SeqCst);
+                if let Some(entry) = cache.read().unwrap().get(&cache_key)
+                    && entry.config_generation == current_generation
+                    && Instant::now() < entry.expires_at
+                {
+                    info!("Cache hit for {} (qtype {})", domain, qtype);
+                    let mut cached_body = entry.response.clone();
+                    // For TCP, the cached DNS message starts at offset 0.
+                    cached_body[0] = buffer[2];
+                    cached_body[1] = buffer[3];
+                    let mut full_response = vec![
+                        (cached_body.len() >> 8) as u8,
+                        (cached_body.len() & 0xFF) as u8,
+                    ];
+                    full_response.extend_from_slice(&cached_body);
+                    if let Err(e) = stream.write_all(&full_response) {
+                        error!("Failed to send cached TCP response: {}", e);
                     }
+                    return;
                 }
                 let conf = config.read().expect("Failed to acquire config lock");
                 let response_body = if let Some(ip) = resolve_domain_from_config(&conf, &domain) {
                     match (qtype, ip) {
                         (1, IpAddr::V4(ipv4)) | (255, IpAddr::V4(ipv4)) => {
                             info!("[TCP] Resolving {} -> {}", domain, ipv4);
-                            DNSHandler::build_dns_response(&buffer[2..query_size + 2], IpAddr::V4(ipv4), qtype)
+                            DNSHandler::build_dns_response(
+                                &buffer[2..query_size + 2],
+                                IpAddr::V4(ipv4),
+                                qtype,
+                            )
                         }
                         (28, IpAddr::V6(ipv6)) | (255, IpAddr::V6(ipv6)) => {
                             info!("[TCP] Resolving {} -> {}", domain, ipv6);
-                            DNSHandler::build_dns_response(&buffer[2..query_size + 2], IpAddr::V6(ipv6), qtype)
+                            DNSHandler::build_dns_response(
+                                &buffer[2..query_size + 2],
+                                IpAddr::V6(ipv6),
+                                qtype,
+                            )
                         }
                         _ => {
-                            info!("[TCP] Record type mismatch for {}, returning NXDOMAIN", domain);
+                            info!(
+                                "[TCP] Record type mismatch for {}, returning NXDOMAIN",
+                                domain
+                            );
                             DNSHandler::build_nxdomain_response(&buffer[2..query_size + 2])
                         }
                     }
@@ -384,7 +480,10 @@ fn handle_tcp_request(
                             resp
                         }
                         None => {
-                            info!("[TCP] Fallback resolution for {} failed, returning NXDOMAIN", domain);
+                            info!(
+                                "[TCP] Fallback resolution for {} failed, returning NXDOMAIN",
+                                domain
+                            );
                             DNSHandler::build_nxdomain_response(&buffer[2..query_size + 2])
                         }
                     }
@@ -393,7 +492,14 @@ fn handle_tcp_request(
                     DNSHandler::build_nxdomain_response(&buffer[2..query_size + 2])
                 };
                 let expires = Instant::now() + Duration::from_secs(60);
-                cache.write().unwrap().insert(cache_key, CacheEntry { response: response_body.clone(), expires_at: expires });
+                cache.write().unwrap().insert(
+                    cache_key,
+                    CacheEntry {
+                        response: response_body.clone(),
+                        expires_at: expires,
+                        config_generation: current_generation,
+                    },
+                );
                 let mut full_response = vec![
                     (response_body.len() >> 8) as u8,
                     (response_body.len() & 0xFF) as u8,
@@ -433,15 +539,30 @@ fn forward_tcp_query(query: &[u8], fallback_dns: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_config_path(test_name: &str) -> PathBuf {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "kissdns-{}-{}-{}.json",
+            test_name,
+            std::process::id(),
+            timestamp
+        ))
+    }
 
     #[test]
     fn test_extract_domain_name() {
         // Create a query for "example.com"
         let mut query = vec![0u8; 12];
         query.extend_from_slice(&[
-            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            3, b'c', b'o', b'm', 0,
-            0, 1, // QTYPE=A.
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0,
+            1, // QTYPE=A.
             0, 1, // QCLASS=IN.
         ]);
         let domain = DNSHandler::extract_domain_name(&query).unwrap();
@@ -452,13 +573,103 @@ mod tests {
     fn test_parse_query() {
         let mut query = vec![0u8; 12];
         query.extend_from_slice(&[
-            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e',
-            3, b'c', b'o', b'm', 0,
-            0, 1,
-            0, 1,
+            7, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0, 1, 0, 1,
         ]);
         let (domain, qtype) = DNSHandler::parse_query(&query).unwrap();
         assert_eq!(domain, "example.com");
         assert_eq!(qtype, 1);
+    }
+
+    #[test]
+    fn test_reload_replaces_config_and_clears_cache() {
+        let config_path = temporary_config_path("successful-reload");
+        fs::write(
+            &config_path,
+            r#"{
+                "records": {"reload.example": "127.0.0.1"},
+                "fallback_dns": ""
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_config(config_path.to_str().unwrap()).unwrap();
+        let reload = Arc::new(AtomicBool::new(false));
+        let handler = DNSHandler::new(
+            config,
+            config_path.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&reload),
+        );
+        handler.cache.write().unwrap().insert(
+            ("reload.example".to_string(), 1),
+            CacheEntry {
+                response: vec![0, 1],
+                expires_at: Instant::now() + Duration::from_secs(60),
+                config_generation: 0,
+            },
+        );
+
+        fs::write(
+            &config_path,
+            r#"{
+                "records": {"reload.example": "127.0.0.2"},
+                "fallback_dns": "1.1.1.1"
+            }"#,
+        )
+        .unwrap();
+        reload.store(true, Ordering::SeqCst);
+        handler.reload_config_if_requested();
+
+        assert_eq!(
+            handler.resolve_domain("reload.example"),
+            Some("127.0.0.2".parse().unwrap())
+        );
+        assert!(handler.cache.read().unwrap().is_empty());
+        assert_eq!(handler.config_generation.load(Ordering::SeqCst), 1);
+
+        fs::remove_file(config_path).unwrap();
+    }
+
+    #[test]
+    fn test_failed_reload_keeps_config_and_cache() {
+        let config_path = temporary_config_path("failed-reload");
+        fs::write(
+            &config_path,
+            r#"{
+                "records": {"reload.example": "127.0.0.1"},
+                "fallback_dns": ""
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_config(config_path.to_str().unwrap()).unwrap();
+        let reload = Arc::new(AtomicBool::new(false));
+        let handler = DNSHandler::new(
+            config,
+            config_path.to_string_lossy().into_owned(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&reload),
+        );
+        handler.cache.write().unwrap().insert(
+            ("reload.example".to_string(), 1),
+            CacheEntry {
+                response: vec![0, 1],
+                expires_at: Instant::now() + Duration::from_secs(60),
+                config_generation: 0,
+            },
+        );
+
+        fs::write(&config_path, "not valid JSON").unwrap();
+        reload.store(true, Ordering::SeqCst);
+        handler.reload_config_if_requested();
+
+        assert_eq!(
+            handler.resolve_domain("reload.example"),
+            Some("127.0.0.1".parse().unwrap())
+        );
+        assert_eq!(handler.cache.read().unwrap().len(), 1);
+        assert_eq!(handler.config_generation.load(Ordering::SeqCst), 0);
+
+        fs::remove_file(config_path).unwrap();
     }
 }
