@@ -93,6 +93,85 @@ If no configuration file is found, KissDNS creates a default file. For example:
 - **fallback_dns:**  
   DNS server used for queries not found in your local configuration.
 
+## Running in OCI container
+
+1\. Retrieve container
+
+Build manually:
+
+```sh
+docker build --target kissdns-alpine -t kissdns-alpine .
+
+# ... or with podman:
+podman build --target kissdns-alpine -t kissdns-alpine .
+```
+
+> [!NOTE]
+> Typically, building `kissdns-alpine` image is required only once.
+> This image will contain only the built `kissdns` binary,
+> without build tools and source code.
+> Compilation process itself occurs inside the `kissdns-builder-alpine` container.
+> Such design is used to get optimal image.
+
+> [!TIP]
+> When it's required to play with compilation interactively, such command may be used:
+>
+> ```sh
+> docker build --target kissdns-builder-alpine -t kissdns-builder-alpine .
+> docker run -it --rm --volume "$PWD:/src" --entrypoint '/bin/bash' kissdns-builder-alpine
+> # ... do something inside the container, for example `cargo test`
+> ```
+
+2\. Run binary from container
+
+Synopsis:
+
+```
+docker run --rm -it kissdns-alpine [kissdns ARGUMENTS ...]
+```
+
+> [!NOTE]
+> Container filesystem is isolated from host filesystem, to make host directories accessible from the container,
+> it's required to mount it on `docker run` command invocation, for example:
+>
+> ```sh
+> cat << 'EOF' > /tmp/kissdns-config.json
+> {
+>   "records": {
+>     "dev.demo": "172.0.0.1",
+>     "api.demo": "127.0.0.1",
+>     "*.test.demo": "10.0.0.5",
+>     "ipv6.demo": "fe80::6049:67ff:fedb:e84d"
+>   },
+>   "fallback_dns": "8.8.8.8"
+> }
+> EOF
+> 
+> docker run --rm \
+>   --publish '5533:5533/tcp' \
+>   --publish '5533:5533/udp' \
+>   --volume "/tmp/kissdns-config.json:/etc/kissdns-config.json:ro" \
+>   kissdns-alpine -- /etc/kissdns-config.json
+> ```
+> or with additional verbosity:
+> ```sh
+> docker run --rm \
+>   --publish '5533:5533/tcp' \
+>   --publish '5533:5533/udp' \
+>   --env 'RUST_LOG=debug' \
+>   --volume "/tmp/kissdns-config.json:/etc/kissdns-config.json:ro" \
+>   kissdns-alpine -- /etc/kissdns-config.json
+> ```
+
+> [!TIP]
+> Like in example from previous step, when it's required to play with container (containing
+> the only `kissdns`) interactively, such command may be used:
+>
+> ```sh
+> docker run -it --rm --volume "$PWD:/opt/data" --entrypoint '/bin/bash' kissdns-alpine
+> # ... do something inside the container, for example `kissdns 2342`
+> ```
+
 ## Debugging
 
 KissDNS uses the `env_logger` crate for logging. To run with INFO-level logs:
