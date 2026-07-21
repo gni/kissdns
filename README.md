@@ -97,7 +97,16 @@ If no configuration file is found, KissDNS creates a default file. For example:
 
 1\. Retrieve container
 
-Build manually:
+Pull published container from ghcr.io:
+
+```sh
+docker pull ghcr.io/unsektor/kissdns:latest-alpine
+
+# ... or with podman:
+podman pull ghcr.io/unsektor/kissdns:latest-alpine
+```
+
+or build manually:
 
 ```sh
 docker build --target kissdns-alpine -t kissdns-alpine .

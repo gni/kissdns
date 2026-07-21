@@ -1,0 +1,149 @@
+name: CI/CD
+
+on:
+  push:
+    tags: [ '*.*.*' ]
+    branches: [ '*' ]
+  pull_request:
+    branches: [ master ]
+  release:
+    types: [ published ]
+
+permissions:
+  contents: write
+  id-token: write
+  packages: write
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: 'Test'
+        run: |
+          sudo apt-get -y update && sudo apt-get -y install ansifilter;
+          {
+            echo '## Tests'
+            echo '```'
+            cargo test | ansifilter
+            echo '```' 
+          } > "$GITHUB_STEP_SUMMARY"
+
+      - name: Build docker image
+        run: |
+          mkdir ./public-build
+          docker build --target kissdns-alpine -t kissdns-alpine .
+          docker cp $(docker create kissdns-alpine):/usr/local/bin/kissdns ./public-build/kissdns-alpine
+
+      - name: Save Docker Image to File
+        run:  docker save -o kissdns-alpine.tar kissdns-alpine
+
+      - name: 'Acceptance test'
+        run: |
+          set -eux
+          sudo apt-get -y update && sudo apt-get -y install dnsutils;
+
+          cat << 'EOF' > /tmp/kiss-config.json
+          {
+            "records": {
+              "dev.demo": "172.0.0.1",
+              "api.demo": "127.0.0.1",
+              "*.test.demo": "10.0.0.5",
+              "ipv6.demo": "fe80::6049:67ff:fedb:e84d"
+            },
+            "fallback_dns": "8.8.8.8"
+          }
+          EOF
+
+          container_id=$(docker run -d --publish '5533:5533/tcp' --publish '5533:5533/udp' --env 'RUST_LOG=debug' --volume "/tmp/kiss-config.json:/etc/kiss-config.json:ro" kissdns-alpine -- /etc/kiss-config.json)
+          echo "Waiting for DNS server to start..."
+          
+          for i in {1..30}; do
+              if dig @127.0.0.1 -p 5533 dev.demo +timeout=1 > /dev/null 2>&1; then
+                break
+              fi
+            
+              if [ $i -eq 30 ]; then
+                echo "DNS server failed to respond within 30 seconds" > /dev/stderr
+                echo "Container logs:" > /dev/stderr
+                docker logs "$container_id" > /dev/stderr
+                docker container stop "$container_id" 2>/dev/null || true
+                exit 1
+              fi
+              sleep 1
+            done
+
+          EXIT_CODE=0
+
+          {
+            echo '## Acceptance test'
+
+            echo '```'
+            echo $ dig @127.0.0.1 -p 5533 dev.demo
+          } >> "$GITHUB_STEP_SUMMARY"
+          
+          dig @127.0.0.1 -p 5533 dev.demo | tee -a "$GITHUB_STEP_SUMMARY" | grep -q 172.0.0.1 || export EXIT_CODE=1
+          
+          echo $ dig @127.0.0.1 -p 5533 sub.test.demo >> "$GITHUB_STEP_SUMMARY"
+          dig @127.0.0.1 -p 5533 sub.test.demo | tee -a "$GITHUB_STEP_SUMMARY" | grep -q 10.0.0.5 || export EXIT_CODE=1
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          
+          docker container stop "$container_id"
+          exit "$EXIT_CODE"
+
+      - name: Upload Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: kissdns-alpine.tar
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: public-build-artifact
+          path: ./public-build/
+  
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: startsWith(github.ref, 'refs/tags/')
+    
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download Image Artifact (Docker Image)
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Image and Push to GHCR
+        run: |
+          docker load -i kissdns-alpine.tar
+          
+          docker tag kissdns-alpine ghcr.io/${{ github.repository_owner }}/kissdns:${{ github.ref_name }}-alpine
+          docker tag kissdns-alpine ghcr.io/${{ github.repository_owner }}/kissdns:latest-alpine
+          docker push ghcr.io/${{ github.repository_owner }}/kissdns:${{ github.ref_name }}-alpine
+          docker push ghcr.io/${{ github.repository_owner }}/kissdns:latest-alpine
+
+      -   name: Download Binary Artifact (kissdns)
+          uses: actions/download-artifact@v4
+          with:
+            name: public-build-artifact
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: kissdns
+          generate_release_notes: true
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
